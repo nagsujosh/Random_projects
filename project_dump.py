@@ -5,44 +5,31 @@ from pathlib import Path
 
 # ---------------- settings ----------------
 
-# Extensions we actually care about
-ALLOWED_EXTS = {
-    ".go",
-    ".py",
-    ".proto",
-    ".txt",
-    ".md",
-    ".json",
-    ".yml",
-    ".yaml",
-    ".toml",
-    ".cfg",
-    ".conf",
-    ".ini",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".fish",
-    ".sum",
-    ".mod",
-    ".lock",
-    ".makefile",
-    ".mk",
-    ".c",
-    ".h",
-    ".cc",
-    ".cpp",
-    ".hpp",
-    ".java",
-    ".rs",
-    ".ts",
-    ".tsx",
-    ".js",
-    ".jsx",
-    ".sql",
-    ".csv",
-    ".pdf",
+# Instead of a tiny allowlist, we include all text/code-like files
+# and exclude only *known binary* extensions. PDFs are handled specially.
+BINARY_EXTS = {
+    # images
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico", ".svg",
+    # audio
+    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a",
+    # video
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    # archives / packages
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".deb", ".rpm", ".apk",
+    # compiled / bytecode / objects
+    ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".pyc", ".class", ".jar", ".war",
+    # fonts
+    ".ttf", ".otf", ".woff", ".woff2",
+    # office binaries
+    ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+    # big data/binaries (skip by default)
+    ".h5", ".hdf5", ".parquet", ".feather", ".npy", ".npz", ".pb", ".onnx", ".pt", ".pth",
+    # other binaries
+    ".iso", ".dmg",
 }
+
+# Special-case: we still allow PDFs (we try to extract text)
+ALWAYS_ALLOW_EXTS = {".pdf"}
 
 # Also include these specific filenames even if extension is weird / missing
 ALWAYS_INCLUDE_NAMES = {
@@ -58,6 +45,11 @@ ALWAYS_INCLUDE_NAMES = {
     "buf.yaml",
     "buf.gen.yaml",
     "buf.lock",
+}
+
+# Explicit file basenames to exclude from reading (still appear in tree)
+EXCLUDE_NAMES = {
+    "project_dump.py",
 }
 
 # Directories to skip (not shown in traversal for file contents, but still appear in tree)
@@ -113,10 +105,12 @@ def build_tree(root_dir: Path) -> str:
 def should_include_file(path: Path) -> bool:
     """
     Decide if this file should be dumped.
-    Rules:
-    - if it's in ALWAYS_INCLUDE_NAMES: yes
-    - else if its extension is in ALLOWED_EXTS: yes
-    - else no
+    New rules:
+    - Never include script itself or any file in EXCLUDE_NAMES.
+    - If in ALWAYS_INCLUDE_NAMES => include.
+    - If suffix in ALWAYS_ALLOW_EXTS (e.g., .pdf) => include.
+    - If it has an extension and it's NOT in BINARY_EXTS => include.
+    - Otherwise => exclude.
     """
     if path.is_dir():
         return False
@@ -124,20 +118,32 @@ def should_include_file(path: Path) -> bool:
     name = path.name
     suffix = path.suffix.lower()
 
-    if name in ALWAYS_INCLUDE_NAMES:
-        return True
+    # Exclude the file explicitly requested
+    if name in EXCLUDE_NAMES:
+        return False
 
-    if suffix in ALLOWED_EXTS:
-        return True
-
-    # Handle some common no-suffix cases like "Makefile" or "Dockerfile"
-    # (Dockerfile has no suffix but isn't always in ALWAYS_INCLUDE_NAMES by default)
-    if name == "Dockerfile":
-        return True
+    # Exclude the running script file (whatever its basename is)
+    try:
+        if Path(__file__).resolve().name == name:
+            return False
+    except NameError:
+        # __file__ may not exist in some interactive contexts; ignore
+        pass
 
     # Ignore obvious macOS junk
     if name == ".DS_Store":
         return False
+
+    if name in ALWAYS_INCLUDE_NAMES:
+        return True
+
+    # Always allow PDFs (handled separately by extractor)
+    if suffix in ALWAYS_ALLOW_EXTS:
+        return True
+
+    # If it has an extension and it's NOT a known-binary => include
+    if suffix and suffix not in BINARY_EXTS:
+        return True
 
     return False
 
@@ -223,7 +229,6 @@ def extract_pdf_text(path: Path) -> str:
     try:
         import pypdf
     except Exception:
-        # pypdf not available, warn instead of crashing
         try:
             size_bytes = path.stat().st_size
         except Exception:
@@ -243,7 +248,6 @@ def extract_pdf_text(path: Path) -> str:
             f"File name: {path.name}\n"
         )
 
-    # dump every page in full, mark page boundaries
     out_chunks = [f"<<PDF EXTRACTED TEXT: {path.name} ({len(reader.pages)} pages)>>", ""]
     for i, page in enumerate(reader.pages):
         try:
