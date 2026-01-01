@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
+"""
+Repository prompt dumper
+
+Primary target ecosystems:
+- Python
+- TypeScript / JavaScript
+- Java
+- Go
+
+Design:
+- Binary denylist, text allow-by-default
+- Language-aware directory exclusions
+- Safe handling of secrets, env files, and large files
+"""
+
 import os
 import sys
 from pathlib import Path
+from typing import List, Tuple
 
-# ---------------- settings ----------------
+# ---------------------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------------------
 
-# Instead of a tiny allowlist, we include all text/code-like files
-# and exclude only *known binary* extensions. PDFs are handled specially.
+# Known binary extensions (hard denylist)
 BINARY_EXTS = {
     # images
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico", ".svg",
@@ -14,306 +31,323 @@ BINARY_EXTS = {
     ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a",
     # video
     ".mp4", ".mov", ".avi", ".mkv", ".webm",
-    # archives / packages
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".deb", ".rpm", ".apk",
-    # compiled / bytecode / objects
-    ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".pyc", ".class", ".jar", ".war",
+    # archives
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    # compiled / bytecode
+    ".exe", ".dll", ".so", ".dylib", ".o", ".a",
+    ".pyc", ".class",
+    # package formats
+    ".jar", ".war",
     # fonts
     ".ttf", ".otf", ".woff", ".woff2",
-    # office binaries
+    # office
     ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
-    # big data/binaries (skip by default)
-    ".h5", ".hdf5", ".parquet", ".feather", ".npy", ".npz", ".pb", ".onnx", ".pt", ".pth",
-    # other binaries
+    # data / ML
+    ".h5", ".hdf5", ".parquet", ".feather", ".npy", ".npz",
+    ".pb", ".onnx", ".pt", ".pth",
+    # disk images
     ".iso", ".dmg",
 }
 
-# Special-case: we still allow PDFs (we try to extract text)
-ALWAYS_ALLOW_EXTS = {".pdf"}
-
-# Also include these specific filenames even if extension is weird / missing
-ALWAYS_INCLUDE_NAMES = {
-    "Makefile",
-    "Dockerfile",
-    "LICENSE",
-    "LICENSE.txt",
-    "README",
-    "README.txt",
-    "README.md",
-    "go.mod",
-    "go.sum",
-    "buf.yaml",
-    "buf.gen.yaml",
-    "buf.lock",
+# Extensions that are binary but explicitly allowed
+ALWAYS_ALLOW_EXTS = {
+    ".pdf",
 }
 
-# Explicit file basenames to exclude from reading (still appear in tree)
+# Always-include important repo metadata (extensionless or critical)
+ALWAYS_INCLUDE_NAMES = {
+    # general
+    "README",
+    "README.md",
+    "README.txt",
+    "LICENSE",
+    "LICENSE.txt",
+    "Makefile",
+    "Dockerfile",
+
+    # JS / TS
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "tsconfig.json",
+    "jsconfig.json",
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.ts",
+    "tailwind.config.js",
+    "tailwind.config.ts",
+    "postcss.config.js",
+
+    # Python
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "requirements.txt",
+    "Pipfile",
+    "Pipfile.lock",
+
+    # Java
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+
+    # Go
+    "go.mod",
+    "go.sum",
+}
+
+# Explicit filenames to exclude
 EXCLUDE_NAMES = {
     "project_dump.py",
 }
 
-# Directories to skip (not shown in traversal for file contents, but still appear in tree)
+# Environment / secrets (exclude ALL variants)
+ENV_FILE_PREFIXES = (
+    ".env",
+)
+
+# Directories to skip entirely (language-aware)
 SKIP_DIRS = {
+    # VCS / IDE
     ".git",
     ".idea",
     ".vscode",
+
+    # Python
     "__pycache__",
-    "vendor",
-    "node_modules",
     ".venv",
     "venv",
+
+    # JS / TS
+    "node_modules",
+    ".next",
+    "dist",
+    "out",
+    "coverage",
+
+    # Java
+    "target",
+    "build",
+
+    # Go
+    "bin",
+    "pkg",
+
+    # Misc
+    ".cache",
 }
 
-# For safety, don't read insanely huge binary-ish files for non-PDF
+# Safety limits
 MAX_BYTES_PER_FILE = 200_000
 
-# .txt policy
+# Text summarization policy
 TXT_LINE_LIMIT = 50
 TXT_HEAD_LINES = 10
 TXT_TAIL_LINES = 10
 
-
-# ---------------- helpers ----------------
+# ---------------------------------------------------------------------
+# TREE BUILDER
+# ---------------------------------------------------------------------
 
 def build_tree(root_dir: Path) -> str:
-    """
-    Return a 'tree' style view of the directory, including skipped dirs for context.
-    """
-    lines = []
+    """Return a tree-style view of the directory."""
+    lines: List[str] = []
 
     def walk(dir_path: Path, prefix: str = ""):
-        # sort dirs first then files
-        entries = sorted(
-            dir_path.iterdir(),
-            key=lambda p: (p.is_file(), p.name.lower())
-        )
+        try:
+            entries = sorted(
+                dir_path.iterdir(),
+                key=lambda p: (p.is_file(), p.name.lower()),
+            )
+        except PermissionError:
+            return
 
         total = len(entries)
         for i, entry in enumerate(entries):
             connector = "└── " if i == total - 1 else "├── "
             lines.append(f"{prefix}{connector}{entry.name}")
 
-            if entry.is_dir():
-                child_prefix = f"{prefix}    " if i == total - 1 else f"{prefix}│   "
+            if entry.is_dir() and entry.name not in SKIP_DIRS:
+                child_prefix = (
+                    f"{prefix}    " if i == total - 1 else f"{prefix}│   "
+                )
                 walk(entry, child_prefix)
 
     lines.append(root_dir.name)
     walk(root_dir)
     return "\n".join(lines)
 
+# ---------------------------------------------------------------------
+# FILE FILTERING
+# ---------------------------------------------------------------------
+
+def is_env_file(path: Path) -> bool:
+    name = path.name.lower()
+    return any(name == p or name.startswith(p + ".") for p in ENV_FILE_PREFIXES)
 
 def should_include_file(path: Path) -> bool:
-    """
-    Decide if this file should be dumped.
-    New rules:
-    - Never include script itself or any file in EXCLUDE_NAMES.
-    - If in ALWAYS_INCLUDE_NAMES => include.
-    - If suffix in ALWAYS_ALLOW_EXTS (e.g., .pdf) => include.
-    - If it has an extension and it's NOT in BINARY_EXTS => include.
-    - Otherwise => exclude.
-    """
     if path.is_dir():
         return False
 
     name = path.name
     suffix = path.suffix.lower()
 
-    # Exclude the file explicitly requested
+    # Explicit excludes
     if name in EXCLUDE_NAMES:
         return False
 
-    # Exclude the running script file (whatever its basename is)
+    # Secrets / env
+    if is_env_file(path):
+        return False
+
+    # OS junk
+    if name == ".DS_Store":
+        return False
+
+    # Exclude the running script itself
     try:
         if Path(__file__).resolve().name == name:
             return False
     except NameError:
-        # __file__ may not exist in some interactive contexts; ignore
         pass
 
-    # Ignore obvious macOS junk
-    if name == ".DS_Store":
-        return False
-
+    # Always include important metadata
     if name in ALWAYS_INCLUDE_NAMES:
         return True
 
-    # Always allow PDFs (handled separately by extractor)
+    # Explicitly allowed binary-like formats
     if suffix in ALWAYS_ALLOW_EXTS:
         return True
 
-    # If it has an extension and it's NOT a known-binary => include
+    # Include everything that is not a known binary
     if suffix and suffix not in BINARY_EXTS:
         return True
 
     return False
 
+# ---------------------------------------------------------------------
+# FILE READING
+# ---------------------------------------------------------------------
 
-def _read_file_bytes_and_maybe_truncate(path: Path):
-    """
-    Internal helper for non-PDF files.
-    Reads raw bytes and truncates if larger than MAX_BYTES_PER_FILE.
-    Returns (decoded_text, was_truncated, raw_len_bytes).
-    """
+def _read_file_bytes(path: Path):
     try:
         raw = path.read_bytes()
     except Exception as e:
-        return (f"<<ERROR READING FILE: {e}>>", False, 0)
-
-    raw_len = len(raw)
+        return f"<<ERROR READING FILE: {e}>>", False
 
     truncated = False
-    if raw_len > MAX_BYTES_PER_FILE:
+    if len(raw) > MAX_BYTES_PER_FILE:
         raw = raw[:MAX_BYTES_PER_FILE]
         truncated = True
 
-    # Try to decode as text
-    text = None
     for enc in ("utf-8", "latin-1"):
         try:
             text = raw.decode(enc, errors="replace")
             break
         except Exception:
             continue
-
-    if text is None:
+    else:
         text = "<<UNDECODABLE CONTENT>>"
 
     if truncated:
-        text += (
-            "\n\n<<TRUNCATED: file was larger than "
-            f"{MAX_BYTES_PER_FILE} bytes>>\n"
-        )
+        text += f"\n\n<<TRUNCATED at {MAX_BYTES_PER_FILE} bytes>>"
 
-    return (text, truncated, raw_len)
+    return text, truncated
 
+def summarize_txt(text: str) -> str:
+    lines = text.splitlines()
+    if len(lines) <= TXT_LINE_LIMIT:
+        return text
 
-def summarize_txt_if_large(full_text: str) -> str:
-    """
-    .txt rule:
-    - If <= 50 lines total: include whole file
-    - If > 50 lines: include first 10 and last 10 lines,
-      with an annotation
-    """
-    lines = full_text.splitlines()
-    total_lines = len(lines)
-
-    if total_lines <= TXT_LINE_LIMIT:
-        return full_text
-
-    head_lines = lines[:TXT_HEAD_LINES]
-    tail_lines = lines[-TXT_TAIL_LINES:]
-
-    preview = []
-    preview.append(
-        f"<<SHOWING FIRST {TXT_HEAD_LINES} AND LAST {TXT_TAIL_LINES} LINES OF LARGE TEXT FILE "
-        f"(total {total_lines} lines)>>"
+    return "\n".join(
+        [
+            f"<<SHOWING FIRST {TXT_HEAD_LINES} AND LAST {TXT_TAIL_LINES} LINES "
+            f"(total {len(lines)} lines)>>",
+            "",
+            "<<BEGIN FIRST>>",
+            *lines[:TXT_HEAD_LINES],
+            "<<END FIRST>>",
+            "",
+            "<<BEGIN LAST>>",
+            *lines[-TXT_TAIL_LINES:],
+            "<<END LAST>>",
+        ]
     )
-    preview.append("")
-    preview.append(f"<<BEGIN FIRST {TXT_HEAD_LINES} LINES>>")
-    preview.extend(head_lines)
-    preview.append(f"<<END FIRST {TXT_HEAD_LINES} LINES>>")
-    preview.append("")
-    preview.append(f"<<BEGIN LAST {TXT_TAIL_LINES} LINES>>")
-    preview.extend(tail_lines)
-    preview.append(f"<<END LAST {TXT_TAIL_LINES} LINES>>")
-
-    return "\n".join(preview)
-
 
 def extract_pdf_text(path: Path) -> str:
-    """
-    Extract ALL text from a PDF using pypdf.
-    No summarization.
-    If pypdf is not installed or extraction fails, return a fallback note.
-    """
     try:
         import pypdf
     except Exception:
-        try:
-            size_bytes = path.stat().st_size
-        except Exception:
-            size_bytes = "UNKNOWN"
         return (
-            "<<PDF CONTENT NOT EXTRACTED: 'pypdf' not installed>>\n"
-            f"File name: {path.name}\n"
-            f"Approx size: {size_bytes} bytes\n"
-            "Run: pip install pypdf\n"
+            "<<PDF CONTENT NOT EXTRACTED: pypdf not installed>>\n"
+            "Run: pip install pypdf"
         )
 
     try:
         reader = pypdf.PdfReader(str(path))
     except Exception as e:
-        return (
-            f"<<PDF READ ERROR: {e}>>\n"
-            f"File name: {path.name}\n"
-        )
+        return f"<<PDF READ ERROR: {e}>>"
 
-    out_chunks = [f"<<PDF EXTRACTED TEXT: {path.name} ({len(reader.pages)} pages)>>", ""]
+    chunks = [
+        f"<<PDF EXTRACTED TEXT: {path.name} ({len(reader.pages)} pages)>>",
+        "",
+    ]
+
     for i, page in enumerate(reader.pages):
         try:
-            page_text = page.extract_text() or ""
+            text = page.extract_text() or ""
         except Exception as e:
-            page_text = f"<<ERROR extracting page {i}: {e}>>"
-        out_chunks.append(f"----- [PAGE {i+1}] -----")
-        out_chunks.append(page_text)
+            text = f"<<ERROR extracting page {i+1}: {e}>>"
 
-    return "\n".join(out_chunks)
+        chunks.append(f"----- [PAGE {i+1}] -----")
+        chunks.append(text)
 
+    return "\n".join(chunks)
 
 def read_file(path: Path) -> str:
-    """
-    Returns the text content we embed in the final prompt per file.
-    Behavior:
-    - .pdf  -> extract full text (no summarization)
-    - .txt  -> keep whole file if <= 50 lines, otherwise first/last 10 lines
-    - other -> try to decode as text (utf-8/latin-1), with byte cap
-    """
-    suffix = path.suffix.lower()
-
-    if suffix == ".pdf":
+    if path.suffix.lower() == ".pdf":
         return extract_pdf_text(path)
 
-    text, _trunc, _raw_len = _read_file_bytes_and_maybe_truncate(path)
+    text, _ = _read_file_bytes(path)
 
-    if suffix == ".txt":
-        return summarize_txt_if_large(text)
+    if path.suffix.lower() == ".txt":
+        return summarize_txt(text)
 
     return text
 
+# ---------------------------------------------------------------------
+# COLLECTION
+# ---------------------------------------------------------------------
 
-def collect_files(root_dir: Path):
-    """
-    Walk the directory tree and collect (relative_path, file_content)
-    for all include-worthy files.
-    We skip SKIP_DIRS while descending.
-    """
-    collected = []
+def collect_files(root_dir: Path) -> List[Tuple[str, str]]:
+    collected: List[Tuple[str, str]] = []
 
     for dirpath, dirnames, filenames in os.walk(root_dir):
-        # prune noisy dirs from recursion
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
 
         for fname in filenames:
-            p = Path(dirpath) / fname
-            if should_include_file(p):
-                rel_path = p.relative_to(root_dir)
-                file_text = read_file(p)
-                collected.append((str(rel_path), file_text))
+            path = Path(dirpath) / fname
+            if should_include_file(path):
+                rel = path.relative_to(root_dir)
+                collected.append((str(rel), read_file(path)))
 
-    # deterministic sort
     collected.sort(key=lambda x: x[0].lower())
     return collected
 
+# ---------------------------------------------------------------------
+# PROMPT BUILDING
+# ---------------------------------------------------------------------
 
-def build_prompt(root_dir: Path, tree_text: str, files_data: list[tuple[str, str]]) -> str:
-    """
-    Final prompt text:
-    - Directory tree
-    - Then each file in sorted order
-    """
-    parts = []
+def build_prompt(
+    root_dir: Path,
+    tree_text: str,
+    files: List[Tuple[str, str]],
+) -> str:
+    parts: List[str] = []
 
-    parts.append("This is my repository. Below is the directory tree, followed by the contents of key files.\n")
+    parts.append("This is my repository.\n")
     parts.append(f"Repository root: {root_dir}\n")
 
     parts.append("### DIRECTORY TREE ###")
@@ -321,48 +355,44 @@ def build_prompt(root_dir: Path, tree_text: str, files_data: list[tuple[str, str
     parts.append(tree_text)
     parts.append("```")
 
-    parts.append("### FILES ###")
+    parts.append("\n### FILES ###")
 
-    for rel_path, content in files_data:
-        parts.append(f"\n[BEGIN FILE: {rel_path}]\n```text")
+    for rel_path, content in files:
+        parts.append(f"\n[BEGIN FILE: {rel_path}]")
+        parts.append("```text")
         parts.append(content)
         parts.append("```")
         parts.append(f"[END FILE: {rel_path}]\n")
 
     return "\n".join(parts)
 
+# ---------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------
 
 def main():
-    # arg1 = repo root, arg2 = output file
     if len(sys.argv) != 3:
-        print("Usage: python3 dump_repo_prompt.py /path/to/repo_root /path/to/output_file.txt", file=sys.stderr)
+        print(
+            "Usage: python3 dump_repo_prompt.py <repo_root> <output_file>",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     root_dir = Path(sys.argv[1]).resolve()
     out_path = Path(sys.argv[2]).resolve()
 
-    if not (root_dir.exists() and root_dir.is_dir()):
+    if not root_dir.is_dir():
         print(f"Error: {root_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    # build tree
-    tree_text = build_tree(root_dir)
+    tree = build_tree(root_dir)
+    files = collect_files(root_dir)
+    prompt = build_prompt(root_dir, tree, files)
 
-    # collect and read files
-    files_data = collect_files(root_dir)
-
-    # build full prompt
-    prompt_text = build_prompt(root_dir, tree_text, files_data)
-
-    # make sure output dir exists
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # write file
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(prompt_text)
+    out_path.write_text(prompt, encoding="utf-8")
 
     print(f"Prompt written to {out_path}")
-
 
 if __name__ == "__main__":
     main()
