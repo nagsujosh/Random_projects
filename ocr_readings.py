@@ -7,6 +7,7 @@ Core features
 - Text-first extraction using PyMuPDF; OCR fallback (Tesseract) per page when needed.
 - Optional "--force-ocr" to OCR every page (even if text is present).
 - Preprocessing for OCR: deskew, denoise, adaptive binarization, contrast-limited equalization.
+- **Automatic orientation detection** for rotated pages (0°, 90°, 180°, 270°).
 - Paragraph reflow and hyphenation fixes for wrapped lines.
 - Remove repeated headers/footers and page numbers.
 - Page range selection: process only a slice of the PDF.
@@ -37,6 +38,9 @@ Usage examples
 4) Write plain text, suppress page dividers, and emit debug JSON:
    python reading_pdfs.py input.pdf --out output.txt --no-page-dividers --debug-json debug.json
 
+5) Force a specific rotation for all pages (useful if auto-detect fails):
+   python reading_pdfs.py input.pdf --out output.md --force-rotation 90
+
 Arguments (CLI)
 ---------------
 Positional:
@@ -49,11 +53,13 @@ Optional:
   --lang LANG                 Tesseract language(s) (default: "eng"). Examples: "eng", "eng+spa".
   --dpi DPI                   Rendering DPI for OCR pages (default: 300).
   --force-ocr                 Ignore native PDF text and OCR every page.
-  --text-min-chars N          If a page’s native text has fewer than N characters, switch to OCR (default: 60).
+  --text-min-chars N          If a page's native text has fewer than N characters, switch to OCR (default: 60).
   --start-page P              First page to process (1-based; default: 1).
   --end-page P                Last page to process (inclusive; default: last page).
   --no-page-dividers          Do not include per-page markers in the output file.
   --debug-json PATH           Write a debug JSON file with per-page details (source, lines, paragraphs).
+  --force-rotation DEGREES    Force rotation correction (0, 90, 180, or 270). Skips auto-detection.
+  --no-auto-orient            Disable automatic orientation detection (use only PDF metadata rotation).
 
 Notes:
 - Page indices in the UI and most PDF readers start at 1; this script uses the same (1-based).
@@ -95,8 +101,67 @@ def to_gray(np_img: np.ndarray) -> np.ndarray:
     return np_img
 
 
+def detect_orientation(pil_img: Image.Image) -> int:
+    """
+    Use Tesseract OSD to detect page orientation.
+    Returns rotation needed to correct (0, 90, 180, or 270 degrees).
+    """
+    try:
+        osd = pytesseract.image_to_osd(pil_img, output_type=Output.DICT)
+        rotate = osd.get("rotate", 0)
+        return int(rotate)
+    except pytesseract.TesseractError:
+        # OSD can fail on images with too little text
+        return 0
+    except Exception:
+        return 0
+
+
+def rotate_image_90(img: np.ndarray, angle: int) -> np.ndarray:
+    """
+    Rotate image by 0, 90, 180, or 270 degrees (fast path using cv2.rotate).
+    """
+    angle = angle % 360
+    if angle == 0:
+        return img
+    elif angle == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif angle == 180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    elif angle == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    else:
+        # Shouldn't happen for orientation correction, but handle it
+        (h, w) = img.shape[:2]
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+        cos = np.abs(M[0, 0])
+        sin = np.abs(M[0, 1])
+        new_w = int((h * sin) + (w * cos))
+        new_h = int((h * cos) + (w * sin))
+        M[0, 2] += (new_w / 2) - (w / 2)
+        M[1, 2] += (new_h / 2) - (h / 2)
+        return cv2.warpAffine(img, M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def rotate_pil_image(pil_img: Image.Image, angle: int) -> Image.Image:
+    """
+    Rotate PIL image by 0, 90, 180, or 270 degrees.
+    """
+    angle = angle % 360
+    if angle == 0:
+        return pil_img
+    elif angle == 90:
+        return pil_img.transpose(Image.ROTATE_90)
+    elif angle == 180:
+        return pil_img.transpose(Image.ROTATE_180)
+    elif angle == 270:
+        return pil_img.transpose(Image.ROTATE_270)
+    else:
+        return pil_img.rotate(angle, expand=True)
+
+
 def auto_deskew(gray: np.ndarray) -> np.ndarray:
-    """Estimate skew via minAreaRect on edges; rotate to deskew."""
+    """Estimate skew via minAreaRect on edges; rotate to deskew (small angles only)."""
     inv = cv2.bitwise_not(gray)
     thr = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     edges = cv2.Canny(thr, 50, 150)
@@ -132,8 +197,12 @@ def enhance(gray: np.ndarray) -> np.ndarray:
 
 
 def render_pdf_page(pdf_page: fitz.Page, dpi: int) -> Image.Image:
+    """
+    Render PDF page to PIL Image, respecting any page rotation metadata.
+    """
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
+    # PyMuPDF's get_pixmap respects the page's /Rotate attribute by default
     pix = pdf_page.get_pixmap(matrix=mat, alpha=False)
     return pil_from_pix(pix)
 
@@ -313,6 +382,7 @@ class PageDebug:
     lines_after_strip: List[str]
     paragraphs: List[str]
     char_count_text: int        # number of characters from native extraction for that page
+    rotation_applied: int = 0   # rotation correction applied (0, 90, 180, 270)
 
 
 # -----------------------------
@@ -363,6 +433,8 @@ def process_pdf(
     text_min_chars: int = 60,
     start_page: int = 1,                 # 1-based inclusive
     end_page: Optional[int] = None,      # 1-based inclusive
+    force_rotation: Optional[int] = None,  # Force specific rotation (0, 90, 180, 270)
+    auto_orient: bool = True,            # Use Tesseract OSD for orientation detection
 ) -> Tuple[List[List[str]], List[PageDebug]]:
     """
     Process the PDF within the selected page range.
@@ -414,12 +486,28 @@ def process_pdf(
                 raw_text_lines=raw_text_lines,
                 lines_after_strip=[], paragraphs=paras,
                 char_count_text=len(native_text_all.strip()),
+                rotation_applied=0,
             ))
         else:
             # OCR path
             pil = render_pdf_page(page, dpi=dpi)
+            
+            # Determine rotation correction
+            rotation = 0
+            if force_rotation is not None:
+                rotation = force_rotation % 360
+            elif auto_orient:
+                # Detect orientation using Tesseract OSD
+                rotation = detect_orientation(pil)
+            
+            # Apply rotation if needed
+            if rotation != 0:
+                pil = rotate_pil_image(pil, rotation)
+            
             np_img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
             gray = to_gray(np_img)
+            
+            # Apply fine deskew (small angles) after major rotation correction
             gray = auto_deskew(gray)
             thr = enhance(gray)
             pil_bin = Image.fromarray(thr)
@@ -444,6 +532,7 @@ def process_pdf(
                 raw_text_lines=raw_text_lines,
                 lines_after_strip=[], paragraphs=paras,
                 char_count_text=len(native_text_all.strip()),
+                rotation_applied=rotation,
             ))
 
     # Pass 2: strip repeated headers/footers across the extracted pages
@@ -516,11 +605,15 @@ def main():
     ap.add_argument("--dpi", type=int, default=300, help="Rendering DPI for OCR pages.")
     ap.add_argument("--force-ocr", action="store_true", help="Ignore native text and OCR every page.")
     ap.add_argument("--text-min-chars", type=int, default=60,
-                    help="If a page’s native text has fewer chars than this, OCR it.")
+                    help="If a page's native text has fewer chars than this, OCR it.")
     ap.add_argument("--start-page", type=int, default=1, help="First page to process (1-based, inclusive).")
     ap.add_argument("--end-page", type=int, default=None, help="Last page to process (1-based, inclusive).")
     ap.add_argument("--no-page-dividers", action="store_true", help="Do not include per-page markers.")
     ap.add_argument("--debug-json", type=str, default=None, help="Optional debug JSON path.")
+    ap.add_argument("--force-rotation", type=int, default=None, choices=[0, 90, 180, 270],
+                    help="Force rotation correction (0, 90, 180, or 270 degrees). Skips auto-detection.")
+    ap.add_argument("--no-auto-orient", action="store_true",
+                    help="Disable automatic orientation detection via Tesseract OSD.")
     args = ap.parse_args()
 
     in_path = Path(args.pdf)
@@ -544,6 +637,8 @@ def main():
         text_min_chars=args.text_min_chars,
         start_page=args.start_page,
         end_page=args.end_page,
+        force_rotation=args.force_rotation,
+        auto_orient=not args.no_auto_orient,
     )
     write_outputs(
         pages_paragraphs,
@@ -561,6 +656,7 @@ def main():
             "pages": [{
                 "source": d.source,
                 "char_count_text": d.char_count_text,
+                "rotation_applied": d.rotation_applied,
                 "lines_raw": d.raw_text_lines,
                 "lines_after_strip": d.lines_after_strip,
                 "paragraphs": d.paragraphs
@@ -575,4 +671,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
